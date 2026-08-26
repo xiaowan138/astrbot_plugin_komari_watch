@@ -110,7 +110,7 @@ class KomariWatchPlugin(Star):
         self.state = self._load_state()
         self._stop = asyncio.Event()
         self._check_lock = asyncio.Lock()
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._aiohttp_session: Optional[aiohttp.ClientSession] = None
         self._monitor_task: Optional[asyncio.Task] = None
         try:
             self._monitor_task = asyncio.get_running_loop().create_task(self._monitor_loop())
@@ -139,10 +139,10 @@ class KomariWatchPlugin(Star):
         return {"Authorization": f"Bearer {self.config.komari_token}", "Cookie": f"session_token={self.config.komari_token}"}
 
     async def _session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
+        if getattr(self, "_aiohttp_session", None) is None or self._aiohttp_session.closed:
             timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
-            self._session = aiohttp.ClientSession(timeout=timeout, headers=self._headers())
-        return self._session
+            self._aiohttp_session = aiohttp.ClientSession(timeout=timeout, headers=self._headers())
+        return self._aiohttp_session
 
     async def _get_json(self, endpoint: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         if not self.config.komari_url:
@@ -152,7 +152,11 @@ class KomariWatchPlugin(Star):
             async with session.get(self.config.komari_url.rstrip("/") + endpoint) as response:
                 if response.status != 200:
                     return None, f"Komari API 返回 HTTP {response.status}"
-                payload = await response.json(content_type=None)
+                raw = await response.read()
+                try:
+                    payload = json.loads(raw.decode("utf-8", "replace"))
+                except (ValueError, TypeError) as exc:
+                    return None, f"Komari 返回非 JSON 内容: {exc}"
                 return payload if isinstance(payload, dict) else None, None
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
             return None, f"连接 Komari 失败：{exc}"
@@ -386,11 +390,11 @@ class KomariWatchPlugin(Star):
                 <div class="updated">更新时间：{updated}</div></section>''')
         body = "".join(cards) or '<div class="empty">Komari 没有返回节点数据</div>'
         return f'''<!doctype html><html><head><meta charset="utf-8"><style>
-        *{{box-sizing:border-box}} body{{width:{self.config.image_width}px;margin:0;padding:28px;background:#d7aabd;font-family:"Microsoft YaHei",sans-serif;color:#392d3b}}
-        .wrap{{background:#f7e7ed;border-radius:24px;padding:26px;box-shadow:0 12px 28px #8f627455}} .top{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}}
+        *{{box-sizing:border-box}} body{{width:{self.config.image_width}px;margin:0;padding:14px;background:#d7aabd;font-family:"Microsoft YaHei",sans-serif;color:#392d3b}}
+        .wrap{{background:#f7e7ed;border-radius:20px;padding:16px;box-shadow:0 12px 28px #8f627455}} .top{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}}
         .tag{{background:#fff;border-radius:10px;padding:12px 22px;color:#ee6394;font-size:24px;font-weight:700}} .stamp{{background:#25b9e8;color:#fff;border-radius:12px;padding:12px 18px;font-size:18px;font-weight:700}}
-        h1{{font-size:30px;margin:0 0 4px}} .sub{{color:#927f8c;font-size:15px}} .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}
-        .card{{background:#fffafc;border-radius:18px;padding:20px;box-shadow:0 3px 10px #9f708522}} .node-head,.metric>div,.facts{{display:flex;justify-content:space-between;align-items:center}} .node-head{{margin-bottom:15px;font-size:21px}} .node-head small{{font-size:14px;color:#8e7c88}} .dot{{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:9px}} .online{{background:#42c88a}} .offline{{background:#f05d74}}
+        h1{{font-size:30px;margin:0 0 4px}} .sub{{color:#927f8c;font-size:15px}} .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}
+        .card{{background:#fffafc;border-radius:16px;padding:16px;box-shadow:0 3px 10px #9f708522}} .node-head,.metric>div,.facts{{display:flex;justify-content:space-between;align-items:center}} .node-head{{margin-bottom:15px;font-size:21px}} .node-head small{{font-size:14px;color:#8e7c88}} .dot{{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:9px}} .online{{background:#42c88a}} .offline{{background:#f05d74}}
         .metric{{margin:10px 0}} .metric>div{{font-size:14px;color:#7d6d77}} .metric b{{color:#392d3b}} .metric i{{display:block;height:8px;background:#f1e5ea;border-radius:8px;margin-top:6px;overflow:hidden}} .metric em{{display:block;height:100%;border-radius:8px}} .facts{{flex-wrap:wrap;gap:8px;margin-top:18px;color:#877681;font-size:12px}} .updated{{border-top:1px solid #f0e2e8;margin-top:15px;padding-top:12px;color:#ad9ba4;font-size:11px}} .empty{{padding:40px;text-align:center;color:#927f8c}}
         </style></head><body><main class="wrap"><div class="top"><span class="tag">Komari 监控</span><span class="stamp">{datetime.now().strftime('%Y-%m-%d %H:%M')}</span></div><h1>服务器运行状态</h1><div class="sub">实时资源概览 · 自动刷新由 AstrBot 监控任务负责</div><div class="grid">{body}</div></main></body></html>'''
 
@@ -409,7 +413,10 @@ class KomariWatchPlugin(Star):
     async def _report_result(self, event: AstrMessageEvent, nodes: list[dict[str, Any]]):
         if not nodes:
             return event.plain_result("Komari 没有返回节点。")
-        return event.chain_result(await self._report_chain(nodes))
+        if not self.config.image_output:
+            return event.plain_result(self._format_report(nodes))
+        chain = await self._report_chain(nodes)
+        return event.chain_result(list(chain.chain))
 
     # ---- 节点过滤 / 选择 ----
 
@@ -431,10 +438,10 @@ class KomariWatchPlugin(Star):
     def _visible(self, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [node for node in nodes if self._monitored(node)]
 
-    def _select(self, nodes: list[dict[str, Any]], args: tuple[Any, ...]) -> list[dict[str, Any]]:
-        if not args or not str(args[0]):
+    def _select(self, nodes: list[dict[str, Any]], keyword: str) -> list[dict[str, Any]]:
+        if not isinstance(keyword, str) or not keyword:
             return nodes
-        keyword = str(args[0]).lower()
+        keyword = keyword.lower()
         return [node for node in nodes if any(keyword in value for value in self._node_idents(node))]
 
     def _can_alert(self, record: dict[str, Any], kind: str, now: float) -> bool:
@@ -450,9 +457,10 @@ class KomariWatchPlugin(Star):
                 self.logger.warning("向 %s 推送失败: %s", target, exc)
 
     async def _send_chain(self, chain: MessageChain) -> None:
+        text = chain.get_plain_text() if hasattr(chain, "get_plain_text") else str(chain)
         for target in self._targets():
             try:
-                await self.context.send_message(target, chain)
+                await self.context.send_message(target, MessageChain().message(text))
             except Exception as exc:
                 self.logger.warning("向 %s 推送失败: %s", target, exc)
 
@@ -588,17 +596,17 @@ class KomariWatchPlugin(Star):
         return merged, None
 
     @filter.command("komari_status", alias=["kstatus", "komari"])
-    async def komari_status(self, event: AstrMessageEvent, *args):
+    async def komari_status(self, event: AstrMessageEvent, node: str = ""):
         """查询所有 Komari 节点的状态与资源使用率；可加节点名（支持子串）只看指定节点。"""
         self._start_monitor()
         nodes, error = await self._snapshot()
         if error:
             yield event.plain_result(error)
             return
-        yield await self._report_result(event, self._visible(self._select(nodes, args)))
+        yield await self._report_result(event, self._visible(self._select(nodes, node)))
 
     @filter.command("komari_realtime", alias=["krealtime", "实时状态"])
-    async def komari_realtime(self, event: AstrMessageEvent, *args):
+    async def komari_realtime(self, event: AstrMessageEvent, node: str = ""):
         """查询 Komari WebSocket 实时数据（不经历史兜底）；WebSocket 不可用时提示改用状态命令。"""
         self._start_monitor()
         live = await self._realtime()
@@ -612,7 +620,7 @@ class KomariWatchPlugin(Star):
         merged = self._merge_nodes(static, live)
         for node in merged:
             node["is_online"] = True
-        yield await self._report_result(event, self._visible(self._select(merged, args)))
+        yield await self._report_result(event, self._visible(self._select(merged, node)))
 
     @filter.command("komari_public", alias=["kpublic", "站点信息"])
     async def komari_public(self, event: AstrMessageEvent):
@@ -677,9 +685,9 @@ class KomariWatchPlugin(Star):
                 await self._monitor_task
             except (asyncio.CancelledError, Exception):
                 pass
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        if self._aiohttp_session and not self._aiohttp_session.closed:
+            await self._aiohttp_session.close()
+            self._aiohttp_session = None
 
 
 __all__ = ["KomariWatchPlugin", "KomariWatchConfig"]
