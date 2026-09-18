@@ -133,6 +133,19 @@ async def run():
     text = plugin._history_text({"u1": {"node": nodes[0], "series": series}}, 6)
     check("history text traffic", "流量 ↑" in text)
 
+    # 1.5.0: history sorting and time span labels
+    async def fake_get_json(endpoint):
+        return {"data": {"records": [
+            {"time": 1757000300, "cpu": 30, "ram_percent": 30, "disk_percent": 30},
+            {"time": 1757000100, "cpu": 10, "ram_percent": 10, "disk_percent": 10},
+            {"time": 1757000200, "cpu": 20, "ram_percent": 20, "disk_percent": 20},
+        ]}}, None
+    plugin._get_json = fake_get_json
+    sorted_series = await plugin._history_series({"uuid": "u1"}, 1)
+    check("history series sorted", [p["cpu"] for p in sorted_series] == [10.0, 20.0, 30.0])
+    html_span = plugin._history_html({"u1": {"node": nodes[0], "series": sorted_series}}, 6)
+    check("history html span", "→" in html_span)
+
     # ---- alert engine ----
     global SENT
     sent = SENT
@@ -193,6 +206,11 @@ async def run():
     await plugin._check_once()
     check("panel recovery alert", any("面板已恢复" in s for s in sent))
 
+    # 1.5.0: _check_once returns a summary tuple
+    failed, info = await plugin._check_once()
+    check("check once summary", failed is False and info.get("online") == 1
+          and info.get("offline") == 1 and "alerts" in info)
+
     # ---- commands ----
     plugin._snapshot = ok_snapshot
     results = [r async for r in plugin.komari_top(FakeEvent(), "mem", "3")]
@@ -201,6 +219,16 @@ async def run():
     check("status no match", any("没有匹配" in r[1] for r in results))
     results = [r async for r in plugin.komari_help(FakeEvent())]
     check("help lists top", any("/komari_top" in r[1] for r in results))
+    results = [r async for r in plugin.komari_check(FakeEvent())]
+    check("check command summary", any("检查完成" in r[1] for r in results))
+    plugin._snapshot = err_snapshot
+    results = [r async for r in plugin.komari_check(FakeEvent())]
+    check("check command failure", any("检查失败" in r[1] for r in results))
+    plugin._snapshot = ok_snapshot
+    results = [r async for r in plugin.komari_top(FakeEvent(), "uptime")]
+    check("top uptime", any("运行时长" in r[1] for r in results))
+    sel = plugin._select(live_nodes, ("node1", "node2"))
+    check("select multi keyword", len(sel) == 2)
 
     plugin.state["muted"] = {}
     plugin.state["targets"] = []

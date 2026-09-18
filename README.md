@@ -7,17 +7,17 @@
 
 ## 功能
 
-- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、网络速率、负载与运行时间；可加节点名只看指定节点，如 `/komari_status node01`。卡片头部附"共/在线/离线"统计。
+- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、网络速率、负载与运行时间；可加一个或多个节点名只看指定节点，如 `/komari_status node01 node02`。卡片头部附"共/在线/离线"统计。
 - `/komari_realtime`、`/komari_public`、`/komari_version`：查询实时数据（不经历史兜底）、公开站点信息和服务端版本。
-- `/komari_history`（别名 `/khistory`、`/历史`）：查询历史资源趋势曲线（CPU / 内存 / 磁盘 / 上下行流量，均标注当前值与峰值），如 `/komari_history 6 nodeA`（小时数 1-24，可加节点名过滤）。
+- `/komari_history`（别名 `/khistory`、`/历史`）：查询历史资源趋势曲线（CPU / 内存 / 磁盘 / 上下行流量，均标注当前值与峰值，并标注数据起止时间），如 `/komari_history 6 nodeA`（小时数 1-24，可加节点名过滤）。
 - `/komari_nodes`（别名 `/knodes`）：列出全部节点名称及过滤排除情况，便于填写 `filter_nodes` 与查询参数。
-- `/komari_top [指标] [数量]`（别名 `/ktop`）：资源占用 Top 榜，如 `/komari_top mem 10`（指标 cpu/mem/disk，默认 cpu 前 5，仅统计在线节点）。
+- `/komari_top [指标] [数量]`（别名 `/ktop`）：资源占用 Top 榜，如 `/komari_top mem 10`（指标 cpu/mem/disk/uptime，默认 cpu 前 5，仅统计在线节点）。
 - `/komari_alerts`（别名 `/kalerts`）：查看最近的一批告警记录。
 - `/komari_mute <分钟> [all]`：临时静默告警（默认 30 分钟；默认只静默当前会话，加 `all` 静默全部绑定会话）；`/komari_unmute [all]` 提前恢复。
 - `/komari_help`（别名 `/khelp`）：全部命令总览。
 - `/komari_bind`：把当前 OneBot 私聊或群聊绑定为告警接收目标。
 - `/komari_unbind`：解除当前会话绑定。
-- `/komari_check`：立即执行一次检查。
+- `/komari_check`：立即执行一次检查，返回在线/离线数量与告警摘要；检查失败时会明确提示原因。
 - 后台轮询 `/api/nodes`，优先从 `/api/clients` WebSocket 读取实时指标；WebSocket 被反代禁用时自动使用最近一条负载记录兜底。
 - 节点连续多个周期无心跳才告警；高负载连续多个周期超过阈值才告警；同类告警支持冷却和恢复通知。
 - 同一周期内多个节点离线/恢复会合并成一条告警；Komari 整体不可达时检查会自动指数退避，降低无效重试与日志噪音。

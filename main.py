@@ -115,7 +115,7 @@ def _metric(node: dict[str, Any], name: str) -> Optional[float]:
     return None
 
 
-@register(PLUGIN_ID, "xiaowan", "Komari 监控推送插件", "1.4.0", "https://github.com/xiaowan138/astrbot_plugin_komari_watch")
+@register(PLUGIN_ID, "xiaowan", "Komari 监控推送插件", "1.5.0", "https://github.com/xiaowan138/astrbot_plugin_komari_watch")
 class KomariWatchPlugin(Star):
     """Komari queries plus stateful offline/high-load notifications."""
 
@@ -273,9 +273,12 @@ class KomariWatchPlugin(Star):
             return mapped
         return []
 
-    async def _realtime(self) -> list[dict[str, Any]]:
+    async def _realtime(self) -> tuple[list[dict[str, Any]], bool]:
+        """返回 (在线客户端列表, WS 通道是否可用)。
+        通道可用指至少成功解析出一帧数据：此时客户端列表为空代表"所有节点离线"，
+        不能误判为通道故障而退回历史时间戳兜底，否则会拖延离线告警。"""
         if not self.config.komari_url:
-            return []
+            return [], False
         try:
             session = await self._get_session()
             ws_timeout = aiohttp.ClientTimeout(total=min(self.config.request_timeout, 15))
@@ -290,12 +293,10 @@ class KomariWatchPlugin(Star):
                         payload = json.loads(text)
                     except ValueError:
                         continue
-                    clients = self._parse_ws_clients(payload)
-                    if clients:
-                        return clients
+                    return self._parse_ws_clients(payload), True
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, KeyError):
-            return []
-        return []
+            return [], False
+        return [], False
 
     async def _history_series(self, node: dict[str, Any], hours: int) -> list[dict[str, Any]]:
         uuid = node.get("uuid") or node.get("id")
@@ -323,8 +324,10 @@ class KomariWatchPlugin(Star):
                 used, total = _num(item.get("disk")), _num(item.get("disk_total"))
                 if used is not None and total and total > 0:
                     disk = used / total * 100
-            output.append({"cpu": cpu, "ram": ram, "disk": disk,
+            output.append({"time": self._record_time(item), "cpu": cpu, "ram": ram, "disk": disk,
                            "net_in": _num(item.get("net_in")), "net_out": _num(item.get("net_out"))})
+        # 按时间排序：API 返回乱序时曲线会来回折返。
+        output.sort(key=lambda point: point["time"])
         return output
 
     async def _history_by_node(self, node: dict[str, Any], hours: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -563,13 +566,19 @@ class KomariWatchPlugin(Star):
             series = entry["series"]
             name = html.escape(str(node.get("name") or node.get("hostname") or node.get("id") or "未知节点"))
             online = bool(node.get("is_online"))
+            valid_times = [t for t in (point.get("time") for point in series) if t]
+            if valid_times:
+                span = (f"{datetime.fromtimestamp(min(valid_times)).strftime('%m-%d %H:%M')}"
+                        f" → {datetime.fromtimestamp(max(valid_times)).strftime('%m-%d %H:%M')}")
+            else:
+                span = f"最近 {hours} 小时"
             charts = (
                 self._mini_chart("CPU", [p.get("cpu") for p in series], "#ff6b9d", hours)
                 + self._mini_chart("内存", [p.get("ram") for p in series], "#8b7bff", hours)
                 + self._mini_chart("磁盘", [p.get("disk") for p in series], "#22b8cf", hours)
                 + self._traffic_chart(series, hours)
             )
-            cards.append(f'<section class="card"><div class="node-head"><div><span class="dot {"online" if online else "offline"}"></span><strong>{name}</strong></div><small>{"在线" if online else "离线"} · 最近 {hours} 小时</small></div>{charts}</section>')
+            cards.append(f'<section class="card"><div class="node-head"><div><span class="dot {"online" if online else "offline"}"></span><strong>{name}</strong></div><small>{"在线" if online else "离线"} · {span}</small></div>{charts}</section>')
         body = "".join(cards) or '<div class="empty">没有可用的历史数据</div>'
         return self._page_html("历史资源趋势", f"CPU / 内存 / 磁盘 · 最近 {hours} 小时", body)
 
@@ -633,10 +642,11 @@ class KomariWatchPlugin(Star):
         return [node for node in nodes if self._monitored(node)]
 
     def _select(self, nodes: list[dict[str, Any]], args: tuple[Any, ...]) -> list[dict[str, Any]]:
-        if not args or not str(args[0]):
+        keywords = [str(arg).strip().lower() for arg in args if str(arg).strip()]
+        if not keywords:
             return nodes
-        keyword = str(args[0]).lower()
-        return [node for node in nodes if any(keyword in value for value in self._node_idents(node))]
+        return [node for node in nodes
+                if any(keyword in ident for keyword in keywords for ident in self._node_idents(node))]
 
     def _warn_filter_misconfig(self) -> None:
         if self._filter_warned or self.config.filter_mode != "allow":
@@ -741,8 +751,9 @@ class KomariWatchPlugin(Star):
         for key in [key for key, value in muted.items() if not isinstance(value, (int, float)) or value <= now_ts]:
             del muted[key]
 
-    async def _check_once(self, track_failure: bool = True) -> bool:
-        """Run one monitoring cycle. Returns True if the check failed."""
+    async def _check_once(self, track_failure: bool = True) -> tuple[bool, dict[str, Any]]:
+        """Run one monitoring cycle; returns (failed, summary with online/offline/alert counts)."""
+        self._warn_filter_misconfig()
         async with self._check_lock:
             nodes, error = await self._snapshot()
             if error:
@@ -757,7 +768,7 @@ class KomariWatchPlugin(Star):
                         self._save_state()
                         await self._send(message)
                 self.logger.warning(error)
-                return True
+                return True, {"error": error}
             self._failure_count = 0
             if self.state.get("panel_alert"):
                 self.state["panel_alert"] = False
@@ -773,6 +784,8 @@ class KomariWatchPlugin(Star):
             high_recovered: list[tuple[str, str]] = []
             restarts: list[str] = []
             long_offline: list[str] = []
+            online_count = 0
+            offline_count = 0
             for node in nodes:
                 key = str(node.get("uuid") or node.get("id") or node.get("name") or "unknown")
                 known_keys.add(key)
@@ -782,6 +795,10 @@ class KomariWatchPlugin(Star):
                 record.setdefault("sent", {})
                 record.setdefault("active", {})
                 is_online = bool(node["is_online"])
+                if is_online:
+                    online_count += 1
+                else:
+                    offline_count += 1
                 record["offline"] = record.get("offline", 0) + 1 if not is_online else 0
                 cpu, mem, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
                 # 离线节点的指标可能是陈旧历史值，跳过其高负载告警，避免死节点误报。
@@ -864,7 +881,7 @@ class KomariWatchPlugin(Star):
                 await self._send("\n\n".join(alerts))
             if self.config.status_report_interval > 0 or (self.config.status_report_time or "").strip():
                 await self._maybe_status_push(nodes, now)
-            return False
+            return False, {"online": online_count, "offline": offline_count, "alerts": len(alerts)}
 
     def _poll_delay(self, failed: bool) -> float:
         if not failed:
@@ -877,7 +894,7 @@ class KomariWatchPlugin(Star):
             while not self._stop.is_set():
                 failed = False
                 if self._targets() and self.config.komari_url:
-                    failed = await self._check_once()
+                    failed, _ = await self._check_once()
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self._poll_delay(failed))
                 except asyncio.TimeoutError:
@@ -893,8 +910,7 @@ class KomariWatchPlugin(Star):
         static, error = await self._nodes()
         if error:
             return [], error
-        live = await self._realtime()
-        ws_live = bool(live)
+        live, ws_live = await self._realtime()
         if ws_live:
             stamp = datetime.now(timezone.utc).isoformat()
             for item in live:
@@ -944,12 +960,12 @@ class KomariWatchPlugin(Star):
         """查询 Komari WebSocket 实时数据（不经历史兜底）；WebSocket 不可用时提示改用状态命令。"""
         self._start_monitor()
         async with self._check_lock:
-            live = await self._realtime()
+            live, ws_ok = await self._realtime()
             static: list[dict[str, Any]] = []
             static_error: Optional[str] = None
-            if live:
+            if ws_ok:
                 static, static_error = await self._nodes()
-        if not live:
+        if not ws_ok:
             yield event.plain_result("WebSocket 实时通道暂时不可用（可能被反代禁用），请改用 /komari_status 查看状态报告。")
             return
         if static_error:
@@ -1019,14 +1035,14 @@ class KomariWatchPlugin(Star):
             "/komari_realtime [节点] - WebSocket 实时数据",
             "/komari_history [小时] [节点] - 历史趋势（1-24 小时）",
             "/komari_nodes - 节点列表速查",
-            "/komari_top [指标] [数量] - 资源占用 Top 榜（cpu/mem/disk）",
+            "/komari_top [指标] [数量] - 资源占用 Top 榜（cpu/mem/disk/uptime）",
             "/komari_alerts - 最近告警记录",
             "/komari_public - 站点信息",
             "/komari_version - 服务端版本",
             "/komari_bind / /komari_unbind - 绑定/解绑告警推送",
             "/komari_mute [分钟] [all] - 静默当前会话（all 为全部会话）",
             "/komari_unmute [all] - 解除静默",
-            "/komari_check - 立即检查一次",
+            "/komari_check - 立即检查一次并返回结果摘要",
         ]
         yield event.plain_result("\n".join(lines))
 
@@ -1057,7 +1073,7 @@ class KomariWatchPlugin(Star):
 
     @filter.command("komari_top", alias=["ktop", "节点排行"])
     async def komari_top(self, event: AstrMessageEvent, *args):
-        """查看资源占用 Top 榜；如 /komari_top mem 10（指标 cpu/mem/disk，默认 cpu 前 5，仅在线节点）。"""
+        """查看资源占用 Top 榜；如 /komari_top mem 10（指标 cpu/mem/disk/uptime，默认 cpu 前 5，仅在线节点）。"""
         self._start_monitor()
         metric, count = "cpu", 5
         for arg in args:
@@ -1068,6 +1084,8 @@ class KomariWatchPlugin(Star):
                 metric = "memory"
             elif text in ("disk", "d", "磁盘"):
                 metric = "disk"
+            elif text in ("uptime", "u", "运行时长"):
+                metric = "uptime"
             elif text.isdigit():
                 count = int(text)
         count = max(1, min(count, 20))
@@ -1076,18 +1094,22 @@ class KomariWatchPlugin(Star):
         if error:
             yield event.plain_result(error)
             return
-        scored = [(_metric(node, metric), node) for node in self._visible(nodes) if node.get("is_online")]
+        if metric == "uptime":
+            scored = [(_num(node.get("uptime")), node) for node in self._visible(nodes) if node.get("is_online")]
+        else:
+            scored = [(_metric(node, metric), node) for node in self._visible(nodes) if node.get("is_online")]
         scored = [(value, node) for value, node in scored if value is not None]
         if not scored:
             yield event.plain_result("没有可排序的在线节点。")
             return
         scored.sort(key=lambda pair: pair[0], reverse=True)
-        label = {"cpu": "CPU", "memory": "内存", "disk": "磁盘"}[metric]
+        label = {"cpu": "CPU", "memory": "内存", "disk": "磁盘", "uptime": "运行时长"}[metric]
         top = scored[:count]
         lines = [f"🏆 Komari {label} Top {len(top)}（在线节点）"]
         for rank, (value, node) in enumerate(top, 1):
             name = node.get("name") or node.get("hostname") or node.get("id") or "未知节点"
-            lines.append(f"{rank}. {name} · {value:.1f}%")
+            shown = self._fmt_duration(value) if metric == "uptime" else f"{value:.1f}%"
+            lines.append(f"{rank}. {name} · {shown}")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("komari_public", alias=["kpublic", "站点信息"])
@@ -1198,9 +1220,15 @@ class KomariWatchPlugin(Star):
 
     @filter.command("komari_check")
     async def komari_check(self, event: AstrMessageEvent):
-        """立即执行一次检查；告警会发往已绑定会话。"""
-        await self._check_once(track_failure=False)
-        yield event.plain_result("✅ 已完成一次 Komari 检查。")
+        """立即执行一次检查；告警会发往已绑定会话，并返回结果摘要。"""
+        failed, info = await self._check_once(track_failure=False)
+        if failed:
+            yield event.plain_result(f"❌ Komari 检查失败：{info.get('error', '未知错误')}\n后台稍后会自动重试。")
+            return
+        summary = f"✅ Komari 检查完成：在线 {info.get('online', 0)} / 离线 {info.get('offline', 0)}"
+        alert_count = info.get("alerts", 0)
+        summary += f"\n已推送 {alert_count} 条告警。" if alert_count else "\n未触发新告警。"
+        yield event.plain_result(summary)
 
     async def terminate(self):
         self._stop.set()
