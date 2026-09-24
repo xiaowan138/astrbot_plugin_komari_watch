@@ -19,5 +19,8 @@
   "prune_missing_cycles": {"type": "int", "description": "节点清理周期", "hint": "节点从服务器消失多少周期后清理其监控状态", "default": 5, "minimum": 1, "maximum": 100},
   "panel_fail_cycles": {"type": "int", "description": "面板故障告警周期", "hint": "连续多少次检查失败后推送面板不可达告警，恢复时自动通知，0 表示关闭", "default": 3, "minimum": 0, "maximum": 10},
   "notify_restart": {"type": "bool", "description": "推送节点重启通知", "hint": "检测到运行时间回退时推送提醒", "default": true},
-  "long_offline_remind_hours": {"type": "int", "description": "长期离线提醒（小时）", "hint": "节点离线超过该时长后每日提醒一次，0 表示关闭", "default": 0, "minimum": 0, "maximum": 720}
+  "long_offline_remind_hours": {"type": "int", "description": "长期离线提醒（小时）", "hint": "节点离线超过该时长后每日提醒一次，0 表示关闭", "default": 0, "minimum": 0, "maximum": 720},
+  "fraction_metrics": {"type": "string", "description": "按 0-1 小数上报的指标", "hint": "这些指标会乘 100 转为百分比，多个用英文逗号分隔（cpu,memory,disk,gpu），留空表示不换算", "default": "cpu,memory,disk"},
+  "expire_remind_days": {"type": "int", "description": "到期提醒（天）", "hint": "节点到期前多少天开始每日提醒一次，续费后自动重新计时，0 表示关闭", "default": 3, "minimum": 0, "maximum": 365},
+  "traffic_alert_percent": {"type": "float", "description": "流量限额告警阈值（%）", "hint": "流量使用率超过该百分比时告警，回落后推送恢复通知；面板未提供累计流量时自动跳过，0 表示关闭", "default": 0, "minimum": 0, "maximum": 100}
 }

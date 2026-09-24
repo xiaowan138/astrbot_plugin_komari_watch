@@ -7,11 +7,13 @@
 
 ## 功能
 
-- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、网络速率、负载与运行时间；可加一个或多个节点名只看指定节点，如 `/komari_status node01 node02`。卡片头部附"共/在线/离线"统计。
+- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、GPU、网络速率、负载、运行时间、流量用量与到期天数；可加一个或多个节点名只看指定节点，如 `/komari_status node01 node02`，也可用 `group:分组名` / `tag:标签` 筛选，如 `/komari_status group:Tokyo`。卡片头部附"共/在线/离线"统计。
 - `/komari_realtime`、`/komari_public`、`/komari_version`：查询实时数据（不经历史兜底）、公开站点信息和服务端版本。
-- `/komari_history`（别名 `/khistory`、`/历史`）：查询历史资源趋势曲线（CPU / 内存 / 磁盘 / 上下行流量，均标注当前值与峰值，并标注数据起止时间），如 `/komari_history 6 nodeA`（小时数 1-24，可加节点名过滤）。
-- `/komari_nodes`（别名 `/knodes`）：列出全部节点名称及过滤排除情况，便于填写 `filter_nodes` 与查询参数。
-- `/komari_top [指标] [数量]`（别名 `/ktop`）：资源占用 Top 榜，如 `/komari_top mem 10`（指标 cpu/mem/disk/uptime，默认 cpu 前 5，仅统计在线节点）。
+- `/komari_history`（别名 `/khistory`、`/历史`）：查询历史资源趋势曲线（CPU / 内存 / 磁盘 / GPU / 上下行流量，均标注当前值与峰值，并标注数据起止时间），如 `/komari_history 6 nodeA`（小时数 1-24，可加节点名或 `group:` / `tag:` 过滤）。
+- `/komari_ping`（别名 `/kping`、`/延迟`）：查看 Ping 任务的延迟与丢包，如 `/komari_ping 4 nodeA`（小时数 1-24，默认 1），按任务分别显示平均/最低/最高延迟与丢包率。
+- `/komari_recent`（别名 `/krecent`、`/最近上报`）：查看节点最近一条上报明细（CPU、GPU、内存、磁盘、负载、温度、进程数、连接数、累计流量等）。
+- `/komari_nodes`（别名 `/knodes`）：列出全部节点名称、所属分组与标签，以及过滤排除情况，便于填写 `filter_nodes` 与查询参数。
+- `/komari_top [指标] [数量]`（别名 `/ktop`）：资源占用 Top 榜，如 `/komari_top mem 10`（指标 cpu/mem/disk/gpu/uptime，默认 cpu 前 5，仅统计在线节点）。
 - `/komari_alerts`（别名 `/kalerts`）：查看最近的一批告警记录。
 - `/komari_mute <分钟> [all]`：临时静默告警（默认 30 分钟；默认只静默当前会话，加 `all` 静默全部绑定会话）；`/komari_unmute [all]` 提前恢复。
 - `/komari_help`（别名 `/khelp`）：全部命令总览。
@@ -22,6 +24,7 @@
 - 节点连续多个周期无心跳才告警；高负载连续多个周期超过阈值才告警；同类告警支持冷却和恢复通知。
 - 同一周期内多个节点离线/恢复会合并成一条告警；Komari 整体不可达时检查会自动指数退避，降低无效重试与日志噪音。
 - 面板连续多次检查失败会推送"不可达"告警，恢复时自动通知；节点重启（运行时间回退）会推送提醒；节点长期离线可配置每日提醒。
+- 节点到期前可配置每日提醒，续费后自动重新计时；流量使用率超过阈值时告警，回落后推送恢复通知。
 
 ## 安装配置
 
@@ -35,6 +38,9 @@
 - `panel_fail_cycles`：面板连续多少次检查失败后推送"面板不可达"告警（恢复时自动通知），0 表示关闭。
 - `notify_restart`：检测到节点运行时间回退（重启）时推送通知。
 - `long_offline_remind_hours`：节点离线超过该小时数后每日提醒一次，0 表示关闭。
+- `fraction_metrics`：按 0-1 小数上报的指标（默认 `cpu,memory,disk`），这些指标会乘 100 转为百分比。若面板上报的 `0.5` 表示 `0.5%` 而非 `50%`，把对应指标从列表中移除或整体留空即可；`gpu` 可按需加入。
+- `expire_remind_days`：节点到期前多少天开始每日提醒一次（默认 3），续费后自动重新计时，0 表示关闭。
+- `traffic_alert_percent`：流量使用率超过该百分比时告警（默认 0，即关闭），回落到阈值以下时推送恢复通知；面板未提供累计流量时自动跳过该节点。
 - `notify_recovery`：关闭后不再推送恢复通知（其余保持不变）。
 
 建议先用 `/komari_check` 验证 API 与权限，再开启较短的轮询周期。Token 只保存在 AstrBot 配置中，不会写入日志。

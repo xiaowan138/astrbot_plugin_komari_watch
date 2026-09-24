@@ -1,11 +1,12 @@
 name: astrbot_plugin_komari_watch
 display_name: Komari 监控推送插件
 author: xiaowan
-version: 1.5.0
+version: 1.6.0
 desc: >-
-  面向 AstrBot 的 Komari 监控插件。支持节点状态、实时资源查询，
-  并通过统一消息来源向 OneBot 会话推送服务器离线和 CPU、内存、磁盘超阈值告警。
-short_desc: Komari 节点查询、离线告警与高负载 OneBot 推送。
+  面向 AstrBot 的 Komari 监控插件。支持节点状态、实时资源查询、历史趋势、
+  延迟丢包与最近上报查询，并通过统一消息来源向 OneBot 会话推送服务器离线、
+  CPU/内存/磁盘/GPU 超阈值、流量超额与到期提醒。
+short_desc: Komari 节点查询、离线/高负载/流量/到期告警与 OneBot 推送。
 support_platforms:
   - aiocqhttp
   - onebot

@@ -24,6 +24,12 @@ _MSG_TYPES = aiohttp.WSMsgType
 
 _ALERT_HISTORY_LIMIT = 50
 
+# 默认按 0-1 小数上报、需要 ×100 的指标；与配置项 fraction_metrics 默认值一致。
+DEFAULT_FRACTION_METRICS = frozenset({"cpu", "memory", "disk"})
+
+# 查询时可用 group:xx / tag:xx 前缀按分组或标签筛选节点。
+_SELECTOR_PREFIXES = {"group:": "group", "分组:": "group", "tag:": "tag", "标签:": "tag"}
+
 
 class KomariWatchConfig(BaseModel):
     komari_url: str = Field("", description="Komari 服务器地址")
@@ -47,6 +53,9 @@ class KomariWatchConfig(BaseModel):
     panel_fail_cycles: int = Field(3, ge=0, le=10, description="面板连续失败多少个周期后推送不可达告警，0 表示关闭")
     notify_restart: bool = True
     long_offline_remind_hours: int = Field(0, ge=0, le=720, description="节点离线超过多少小时后每日提醒一次，0 表示关闭")
+    fraction_metrics: str = Field("cpu,memory,disk", description="按 0-1 小数上报的指标（会×100），多个用英文逗号分隔，留空表示不换算")
+    expire_remind_days: int = Field(3, ge=0, le=365, description="节点到期前多少天开始每日提醒，0 表示关闭")
+    traffic_alert_percent: float = Field(0, ge=0, le=100, description="流量使用率超过该百分比时告警，0 表示关闭")
 
 
 def _num(value: Any) -> Optional[float]:
@@ -80,27 +89,46 @@ def _parse_time(value: Any) -> Optional[datetime]:
         return None
 
 
-def _metric(node: dict[str, Any], name: str) -> Optional[float]:
+def _metric(node: dict[str, Any], name: str, fractions: Optional[frozenset[str]] = None) -> Optional[float]:
+    """读取 CPU/内存/磁盘/GPU 使用率（百分数）。
+
+    部分面板把 0-1 的小数直接当百分数上报（0.5 表示 50%），另有面板上报的
+    0.5 就是 0.5%。因此只有 `fractions` 里显式列出的指标才做 ×100 换算，
+    默认与配置项 `fraction_metrics` 保持一致，避免把真实低负载放大 100 倍。
+    """
+    if fractions is None:
+        fractions = DEFAULT_FRACTION_METRICS
     aliases = {
         "cpu": ("cpu_usage", "cpu_percent", "cpuUsage", "cpu_used_percent", "usage"),
         "memory": ("memory_usage", "memory_percent", "memory_usage_percent", "ram_usage", "ram_percent", "mem_usage", "mem_percent"),
         "disk": ("disk_usage", "disk_percent", "disk_usage_percent", "storage_percent"),
+        "gpu": ("gpu_usage", "gpu_percent", "gpuUsage", "gpu_used_percent"),
     }
+
+    def scale(value: float) -> float:
+        return value * 100 if name in fractions and 0 <= value <= 1 else value
+
     for key in aliases[name]:
         value = _num(node.get(key))
         if value is not None:
-            return value * 100 if 0 <= value <= 1 else value
+            return scale(value)
+    if name == "gpu":
+        # 记录接口里 gpu 是数值百分比；部分面板则在 gpu 对象里给出使用率。
+        value = _num(node.get("gpu"))
+        if value is not None:
+            return scale(value)
     containers = {
         "cpu": (node.get("cpu"),),
         "memory": (node.get("ram"), node.get("memory"), node.get("mem")),
         "disk": (node.get("disk"), node.get("storage")),
+        "gpu": (node.get("gpu"), node.get("gpus")),
     }
     for nested in containers[name]:
         if not isinstance(nested, dict):
             continue
         value = _num(nested.get("usage", nested.get("percent", nested.get("used_percent", nested.get("percentage")))))
         if value is not None:
-            return value * 100 if 0 <= value <= 1 else value
+            return scale(value)
         used, total = _num(nested.get("used")), _num(nested.get("total"))
         if used is not None and total and total > 0:
             return used / total * 100
@@ -115,7 +143,7 @@ def _metric(node: dict[str, Any], name: str) -> Optional[float]:
     return None
 
 
-@register(PLUGIN_ID, "xiaowan", "Komari 监控推送插件", "1.5.0", "https://github.com/xiaowan138/astrbot_plugin_komari_watch")
+@register(PLUGIN_ID, "xiaowan", "Komari 监控推送插件", "1.6.0", "https://github.com/xiaowan138/astrbot_plugin_komari_watch")
 class KomariWatchPlugin(Star):
     """Komari queries plus stateful offline/high-load notifications."""
 
@@ -139,10 +167,16 @@ class KomariWatchPlugin(Star):
         self._failure_count = 0
         self._filter_warned = False
         self._time_report_warned = False
+        self._fractions = self._parse_fractions(self.config.fraction_metrics)
         try:
             self._monitor_task = asyncio.get_running_loop().create_task(self._monitor_loop())
         except RuntimeError:
             self.logger.debug("No running event loop; monitor starts on first command")
+
+    @staticmethod
+    def _parse_fractions(spec: str) -> frozenset[str]:
+        """解析 fraction_metrics 配置：英文逗号分隔的指标名，留空表示不做 0-1 换算。"""
+        return frozenset(token.strip().lower() for token in (spec or "").split(",") if token.strip())
 
     def _load_state(self) -> dict[str, Any]:
         try:
@@ -273,9 +307,26 @@ class KomariWatchPlugin(Star):
             return mapped
         return []
 
+    @staticmethod
+    def _is_clients_payload(payload: Any) -> bool:
+        """判断 WS 帧是否是"客户端列表"数据帧。
+
+        通道里还可能混有 ack/心跳等非数据帧（如 {"status":"ok"}）。此前任何
+        能解析成 JSON 的帧都被当作通道可用，非数据帧会让客户端列表恒为空，
+        进而把"所有节点在线"误判成"全部离线"。这里要求帧具备客户端容器的形状。
+        """
+        if isinstance(payload, list):
+            return True
+        if not isinstance(payload, dict):
+            return False
+        if "data" in payload or "online" in payload:
+            return True
+        # 兼容旧版直接返回 {uuid: 指标} 的扁平结构。
+        return any(isinstance(value, (dict, list)) for value in payload.values())
+
     async def _realtime(self) -> tuple[list[dict[str, Any]], bool]:
         """返回 (在线客户端列表, WS 通道是否可用)。
-        通道可用指至少成功解析出一帧数据：此时客户端列表为空代表"所有节点离线"，
+        通道可用指至少成功解析出一帧客户端数据：此时客户端列表为空代表"所有节点离线"，
         不能误判为通道故障而退回历史时间戳兜底，否则会拖延离线告警。"""
         if not self.config.komari_url:
             return [], False
@@ -293,22 +344,39 @@ class KomariWatchPlugin(Star):
                         payload = json.loads(text)
                     except ValueError:
                         continue
+                    if not self._is_clients_payload(payload):
+                        continue
                     return self._parse_ws_clients(payload), True
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, KeyError):
             return [], False
         return [], False
+
+    async def _records(self, uuid: Any, hours: int) -> list[dict[str, Any]]:
+        """读取一个节点的负载记录。
+
+        部分面板（或反代后的旧版本）不接受 load_type 参数并直接报错，
+        因此首次请求失败时去掉该参数重试一次，避免历史曲线与兜底实时数据整体失效。
+        """
+        query = f"uuid={quote(str(uuid))}&hours={hours}"
+        payload, error = await self._get_json(f"/api/records/load?{query}&load_type=all")
+        if error:
+            self.logger.debug("带 load_type 读取 %s 历史记录失败（%s），改用不带该参数的请求重试", uuid, error)
+            payload, error = await self._get_json(f"/api/records/load?{query}")
+        if error or not payload:
+            return []
+        data = payload.get("data", {})
+        records = data.get("records", []) if isinstance(data, dict) else []
+        return [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []
 
     async def _history_series(self, node: dict[str, Any], hours: int) -> list[dict[str, Any]]:
         uuid = node.get("uuid") or node.get("id")
         if not uuid:
             return []
         try:
-            payload, _ = await self._get_json(f"/api/records/load?uuid={quote(str(uuid))}&hours={hours}&load_type=all")
+            records = await self._records(uuid, hours)
         except Exception as exc:
             self.logger.debug("读取 %s 历史记录失败: %s", uuid, exc)
             return []
-        data = payload.get("data", {}) if payload else {}
-        records = data.get("records", []) if isinstance(data, dict) else []
         output: list[dict[str, Any]] = []
         for item in records:
             if not isinstance(item, dict):
@@ -325,6 +393,7 @@ class KomariWatchPlugin(Star):
                 if used is not None and total and total > 0:
                     disk = used / total * 100
             output.append({"time": self._record_time(item), "cpu": cpu, "ram": ram, "disk": disk,
+                           "gpu": _num(item.get("gpu_percent", item.get("gpu"))),
                            "net_in": _num(item.get("net_in")), "net_out": _num(item.get("net_out"))})
         # 按时间排序：API 返回乱序时曲线会来回折返。
         output.sort(key=lambda point: point["time"])
@@ -348,15 +417,13 @@ class KomariWatchPlugin(Star):
         if not uuid:
             return None
         try:
-            payload, _ = await self._get_json(f"/api/records/load?uuid={quote(str(uuid))}&hours=1&load_type=all")
+            records = await self._records(uuid, 1)
         except Exception as exc:
             self.logger.debug("读取 %s 历史记录失败: %s", uuid, exc)
             return None
-        data = payload.get("data", {}) if payload else {}
-        records = data.get("records", []) if isinstance(data, dict) else []
-        if not isinstance(records, list) or not records:
+        if not records:
             return None
-        latest = max((item for item in records if isinstance(item, dict)), key=self._record_time, default=None)
+        latest = max(records, key=self._record_time, default=None)
         if not latest:
             return None
         item: dict[str, Any] = {"uuid": str(uuid), "updated_at": latest.get("time")}
@@ -373,6 +440,12 @@ class KomariWatchPlugin(Star):
             item["disk_usage"] = latest["disk_percent"]
         if latest.get("net_in") is not None or latest.get("net_out") is not None:
             item["network"] = {"down": latest.get("net_in", 0), "up": latest.get("net_out", 0)}
+        # 累计流量计数器：用于状态卡片的"剩余量"与流量限额告警。
+        for field in ("net_total_up", "net_total_down"):
+            if latest.get(field) is not None:
+                item[field] = latest[field]
+        if latest.get("gpu") is not None:
+            item["gpu_usage"] = latest["gpu"]
         item["load"] = {"load1": latest.get("load", "-")}
         return item
 
@@ -383,6 +456,64 @@ class KomariWatchPlugin(Star):
             return []
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [item for item in results if isinstance(item, dict)]
+
+    async def _recent_record(self, node: dict[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        """读取单个节点的最近一条上报（/api/recent/:uuid）。"""
+        uuid = node.get("uuid") or node.get("id")
+        if not uuid:
+            return None, "节点缺少 uuid，无法查询最近上报。"
+        payload, error = await self._get_json(f"/api/recent/{quote(str(uuid))}")
+        if error:
+            return None, error
+        data = payload.get("data", payload) if payload else None
+        records = data
+        if isinstance(data, dict):
+            records = data.get("records", data.get("data", []))
+        if not isinstance(records, list) or not records:
+            return None, "面板未返回该节点的最近上报。"
+        latest = max((item for item in records if isinstance(item, dict)), key=self._record_time, default=None)
+        return (latest, None) if latest else (None, "面板未返回该节点的最近上报。")
+
+    async def _ping_records(self, uuid: Any, hours: int) -> list[dict[str, Any]]:
+        query = f"hours={hours}" + (f"&uuid={quote(str(uuid))}" if uuid else "")
+        payload, error = await self._get_json(f"/api/records/ping?{query}")
+        if error or not payload:
+            return []
+        data = payload.get("data", payload)
+        records = data
+        if isinstance(data, dict):
+            records = data.get("records", data.get("data", []))
+        return [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []
+
+    @staticmethod
+    def _ping_stats(records: list[dict[str, Any]]) -> dict[str, list[float]]:
+        """按 ping 任务聚合延迟样本；丢包记录的值小于 0，一并计入样本数。"""
+        grouped: dict[str, list[float]] = {}
+        for item in records:
+            value = None
+            for key in ("value", "latency", "ping", "delay"):
+                value = _num(item.get(key))
+                if value is not None:
+                    break
+            if value is None:
+                continue
+            task = item.get("task_id", item.get("task", "默认"))
+            grouped.setdefault(str(task), []).append(value)
+        return grouped
+
+    @staticmethod
+    def _ping_lines(grouped: dict[str, list[float]]) -> list[str]:
+        lines: list[str] = []
+        for task, values in grouped.items():
+            total = len(values)
+            ok = [value for value in values if value >= 0]
+            loss = (total - len(ok)) / total * 100 if total else 0.0
+            if ok:
+                lines.append(f"· 任务 {task}：平均 {sum(ok) / len(ok):.1f}ms / 最低 {min(ok):.1f} / 最高 {max(ok):.1f}"
+                             f" / 丢包 {loss:.1f}%（{total} 次）")
+            else:
+                lines.append(f"· 任务 {task}：全部丢包（{total} 次）")
+        return lines
 
     @staticmethod
     def _merge_nodes(static: list[dict[str, Any]], live: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -413,7 +544,8 @@ class KomariWatchPlugin(Star):
         for node in nodes:
             name = node.get("name") or node.get("hostname") or node.get("id") or "未知节点"
             online = "在线" if node.get("is_online") else "离线"
-            cpu, memory, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
+            cpu, memory, disk = (_metric(node, "cpu", self._fractions), _metric(node, "memory", self._fractions),
+                                 _metric(node, "disk", self._fractions))
             metrics = " / ".join(f"{label} {value:.1f}%" for value, label in ((cpu, "CPU"), (memory, "内存"), (disk, "磁盘")) if value is not None)
             lines.append(f"\n{'🟢' if online == '在线' else '🔴'} {name} · {online}{(' · ' + metrics) if metrics else ''}")
         return "\n".join(lines) if len(lines) > 1 else "Komari 没有返回节点。"
@@ -473,6 +605,63 @@ class KomariWatchPlugin(Star):
         parts.append(f"{minutes}分")
         return "".join(parts)
 
+    # ---- 流量 / 到期 / 分组 ----
+
+    @staticmethod
+    def _traffic(node: dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+        """返回 (已用流量, 流量限额)，单位字节。
+
+        优先使用面板直接给出的 traffic_used；否则用记录里的累计计数器
+        net_total_up/down 按 traffic_limit_type（sum/max/min/up/down）折算，
+        与 Komari 面板自身的口径保持一致。取不到计数器时返回 (None, 限额)。
+        """
+        limit = _num(node.get("traffic_limit"))
+        limit = limit if limit and limit > 0 else None
+        used = _num(node.get("traffic_used"))
+        if used is None:
+            up = _num(node.get("net_total_up"))
+            if up is None:
+                up = _num(node.get("traffic_up"))
+            down = _num(node.get("net_total_down"))
+            if down is None:
+                down = _num(node.get("traffic_down"))
+            if up is not None or down is not None:
+                up, down = up or 0.0, down or 0.0
+                mode = str(node.get("traffic_limit_type") or "sum").lower()
+                used = {"max": max(up, down), "min": min(up, down), "up": up, "down": down}.get(mode, up + down)
+        return used, limit
+
+    def _fmt_traffic(self, node: dict[str, Any]) -> str:
+        used, limit = self._traffic(node)
+        if used is None or not limit:
+            return ""
+        return f"流量 {self._fmt_bytes(used)} / {self._fmt_bytes(limit)}（{used / limit * 100:.0f}%）"
+
+    @staticmethod
+    def _expire_days(node: dict[str, Any]) -> Optional[float]:
+        """剩余天数；无到期时间返回 None，已过期返回负数。"""
+        expire = _parse_time(node.get("expired_at"))
+        if expire is None:
+            return None
+        return (expire - datetime.now(timezone.utc)).total_seconds() / 86400
+
+    def _fmt_expire(self, node: dict[str, Any]) -> str:
+        days = self._expire_days(node)
+        if days is None:
+            return ""
+        if days < 0:
+            return f"已到期 {int(-days)} 天"
+        if days < 1:
+            return "今日到期"
+        return f"剩余 {int(days)} 天"
+
+    @staticmethod
+    def _fmt_group(node: dict[str, Any]) -> str:
+        group = str(node.get("group") or "").strip()
+        tags = [tag.strip() for tag in str(node.get("tags") or "").split(";") if tag.strip()]
+        parts = ([group] if group else []) + ([",".join(tags)] if tags else [])
+        return " / ".join(parts)
+
     def _page_html(self, title: str, subtitle: str, body: str, stats: str = "") -> str:
         return f'''<!doctype html><html><head><meta charset="utf-8"><style>
         *{{box-sizing:border-box}} body{{width:{self.config.image_width}px;margin:0;padding:28px;background:#d7aabd;font-family:"Microsoft YaHei",sans-serif;color:#392d3b}}
@@ -491,7 +680,10 @@ class KomariWatchPlugin(Star):
         for node in nodes:
             name = html.escape(str(node.get("name") or node.get("hostname") or node.get("id") or "未知节点"))
             online = bool(node.get("is_online"))
-            cpu, memory, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
+            cpu = _metric(node, "cpu", self._fractions)
+            memory = _metric(node, "memory", self._fractions)
+            disk = _metric(node, "disk", self._fractions)
+            gpu = _metric(node, "gpu", self._fractions)
             network = node.get("network") if isinstance(node.get("network"), dict) else {}
             load = node.get("load") if isinstance(node.get("load"), dict) else {}
             def progress(label: str, value: Optional[float], color: str) -> str:
@@ -505,9 +697,19 @@ class KomariWatchPlugin(Star):
                 updated = f"最后在线：{html.escape(rel)}"
             else:
                 updated = "状态：离线"
+            gpu_row = progress('GPU', gpu, '#f2a33c') if gpu is not None else ""
+            facts = [
+                f"<span>上行 {html.escape(self._fmt_speed(network.get('up')))}</span>",
+                f"<span>下行 {html.escape(self._fmt_speed(network.get('down')))}</span>",
+                f"<span>负载 {html.escape(str(load.get('load1', '-')))}</span>",
+                f"<span>运行 {html.escape(self._fmt_uptime(node.get('uptime')))}</span>",
+            ]
+            for extra in (self._fmt_traffic(node), self._fmt_expire(node), self._fmt_group(node)):
+                if extra:
+                    facts.append(f"<span>{html.escape(extra)}</span>")
             cards.append(f'''<section class="card"><div class="node-head"><div><span class="dot {'online' if online else 'offline'}"></span><strong>{name}</strong></div><small>{'在线' if online else '离线'}</small></div>
-                {progress('CPU', cpu, '#ff6b9d')}{progress('内存', memory, '#8b7bff')}{progress('磁盘', disk, '#22b8cf')}
-                <div class="facts"><span>上行 {html.escape(self._fmt_speed(network.get('up')))}</span><span>下行 {html.escape(self._fmt_speed(network.get('down')))}</span><span>负载 {html.escape(str(load.get('load1', '-')))}</span><span>运行 {html.escape(self._fmt_uptime(node.get('uptime')))}</span></div>
+                {progress('CPU', cpu, '#ff6b9d')}{progress('内存', memory, '#8b7bff')}{progress('磁盘', disk, '#22b8cf')}{gpu_row}
+                <div class="facts">{''.join(facts)}</div>
                 <div class="updated">{updated}</div></section>''')
         body = "".join(cards) or '<div class="empty">Komari 没有返回节点数据</div>'
         total = len(nodes)
@@ -572,10 +774,13 @@ class KomariWatchPlugin(Star):
                         f" → {datetime.fromtimestamp(max(valid_times)).strftime('%m-%d %H:%M')}")
             else:
                 span = f"最近 {hours} 小时"
+            gpu_values = [p.get("gpu") for p in series]
+            gpu_chart = self._mini_chart("GPU", gpu_values, "#f2a33c", hours) if any(v is not None for v in gpu_values) else ""
             charts = (
                 self._mini_chart("CPU", [p.get("cpu") for p in series], "#ff6b9d", hours)
                 + self._mini_chart("内存", [p.get("ram") for p in series], "#8b7bff", hours)
                 + self._mini_chart("磁盘", [p.get("disk") for p in series], "#22b8cf", hours)
+                + gpu_chart
                 + self._traffic_chart(series, hours)
             )
             cards.append(f'<section class="card"><div class="node-head"><div><span class="dot {"online" if online else "offline"}"></span><strong>{name}</strong></div><small>{"在线" if online else "离线"} · {span}</small></div>{charts}</section>')
@@ -594,7 +799,8 @@ class KomariWatchPlugin(Star):
             traffic = ""
             if last.get("net_in") is not None or last.get("net_out") is not None:
                 traffic = f" / 流量 ↑{self._fmt_speed(last.get('net_out'))} ↓{self._fmt_speed(last.get('net_in'))}"
-            lines.append(f"{name}：CPU {fmt(last.get('cpu'))} / 内存 {fmt(last.get('ram'))} / 磁盘 {fmt(last.get('disk'))}{traffic}")
+            gpu = "" if last.get("gpu") is None else f" / GPU {fmt(last.get('gpu'))}"
+            lines.append(f"{name}：CPU {fmt(last.get('cpu'))} / 内存 {fmt(last.get('ram'))} / 磁盘 {fmt(last.get('disk'))}{gpu}{traffic}")
         return "\n".join(lines) or "没有可用的历史数据。"
 
     async def _chain_from_html(self, html_text: str, text_fallback: str) -> MessageChain:
@@ -641,12 +847,45 @@ class KomariWatchPlugin(Star):
     def _visible(self, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [node for node in nodes if self._monitored(node)]
 
+    @staticmethod
+    def _selectors(args: tuple[Any, ...]) -> list[tuple[str, str]]:
+        """把查询参数解析成 (类型, 值)：group:xx / tag:xx 走分组与标签，其余按节点名匹配。"""
+        selectors: list[tuple[str, str]] = []
+        for arg in args:
+            token = str(arg).strip()
+            if not token:
+                continue
+            lowered = token.lower()
+            for prefix, kind in _SELECTOR_PREFIXES.items():
+                if lowered.startswith(prefix):
+                    value = lowered[len(prefix):].strip()
+                    if value:
+                        selectors.append((kind, value))
+                    break
+            else:
+                selectors.append(("keyword", lowered))
+        return selectors
+
+    @staticmethod
+    def _matches(node: dict[str, Any], kind: str, value: str) -> bool:
+        if kind == "group":
+            return value in str(node.get("group") or "").lower()
+        if kind == "tag":
+            tags = [tag.strip().lower() for tag in str(node.get("tags") or "").split(";") if tag.strip()]
+            return any(value in tag for tag in tags)
+        return any(value in ident for ident in KomariWatchPlugin._node_idents(node))
+
     def _select(self, nodes: list[dict[str, Any]], args: tuple[Any, ...]) -> list[dict[str, Any]]:
-        keywords = [str(arg).strip().lower() for arg in args if str(arg).strip()]
-        if not keywords:
+        selectors = self._selectors(args)
+        if not selectors:
             return nodes
         return [node for node in nodes
-                if any(keyword in ident for keyword in keywords for ident in self._node_idents(node))]
+                if any(self._matches(node, kind, value) for kind, value in selectors)]
+
+    @staticmethod
+    def _keyword_hint(args: tuple[Any, ...]) -> str:
+        tokens = [str(arg).strip() for arg in args if str(arg).strip()]
+        return "、".join(f"「{token}」" for token in tokens)
 
     def _warn_filter_misconfig(self) -> None:
         if self._filter_warned or self.config.filter_mode != "allow":
@@ -660,6 +899,54 @@ class KomariWatchPlugin(Star):
         """Prevent repeated alerts when a node flaps around a threshold."""
         last = _num(record.get("sent", {}).get(kind))
         return last is None or self.config.alert_cooldown == 0 or now - last >= self.config.alert_cooldown
+
+    def _check_expire(self, node: dict[str, Any], record: dict[str, Any], name: str, now: float) -> list[str]:
+        """到期提醒：到期前 expire_remind_days 天起每日提醒一次；续费后重新计时。"""
+        raw = node.get("expired_at")
+        if record.get("expire_at") != raw:
+            # 到期时间变化说明已续费，重置提醒计时。
+            record["expire_at"] = raw
+            record.pop("expire_last_remind", None)
+        if self.config.expire_remind_days <= 0:
+            return []
+        days = self._expire_days(node)
+        if days is None or days > self.config.expire_remind_days:
+            return []
+        last = _num(record.get("expire_last_remind"))
+        if last is not None and now - last < 86400:
+            return []
+        record["expire_last_remind"] = now
+        when = _parse_time(raw)
+        stamp = when.strftime("%Y-%m-%d") if when else "-"
+        left = f"已到期 {int(-days)} 天" if days < 0 else f"剩余 {int(days)} 天"
+        return [f"⏳ Komari 节点即将到期\n节点：{name}\n{left}（到期时间 {stamp}）"]
+
+    def _check_traffic(self, node: dict[str, Any], record: dict[str, Any], name: str,
+                       now: float, is_online: bool) -> list[str]:
+        """流量限额告警：使用率达到阈值时告警，回落到阈值以下时恢复。
+
+        取不到累计流量计数器（面板不提供）时静默跳过，不做无依据的估算。
+        """
+        if self.config.traffic_alert_percent <= 0:
+            return []
+        used, limit = self._traffic(node)
+        if used is None or not limit:
+            return []
+        percent = used / limit * 100
+        threshold = self.config.traffic_alert_percent
+        if (is_online and percent >= threshold and not record["active"].get("traffic")
+                and self._can_alert(record, "traffic", now)):
+            record["sent"]["traffic"] = now
+            record["active"]["traffic"] = True
+            return [f"⚠️ Komari 流量告警\n节点：{name}\n已用 {self._fmt_bytes(used)} / {self._fmt_bytes(limit)}"
+                    f"（{percent:.0f}%），阈值 {threshold:g}%"]
+        if record["active"].get("traffic") and is_online and percent < threshold:
+            record["active"]["traffic"] = False
+            if not self.config.notify_recovery:
+                return []
+            return [f"✅ Komari 流量恢复\n节点：{name}\n已用 {self._fmt_bytes(used)} / {self._fmt_bytes(limit)}"
+                    f"（{percent:.0f}%），已低于阈值 {threshold:g}%"]
+        return []
 
     # ---- 静默 ----
 
@@ -784,6 +1071,8 @@ class KomariWatchPlugin(Star):
             high_recovered: list[tuple[str, str]] = []
             restarts: list[str] = []
             long_offline: list[str] = []
+            expiring: list[str] = []
+            traffic_alerts: list[str] = []
             online_count = 0
             offline_count = 0
             for node in nodes:
@@ -800,10 +1089,19 @@ class KomariWatchPlugin(Star):
                 else:
                     offline_count += 1
                 record["offline"] = record.get("offline", 0) + 1 if not is_online else 0
-                cpu, mem, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
+                # 记录"首次观察到离线"的时刻，离线时长从这里算起，而不是从告警发出时刻算起。
+                if not is_online:
+                    record.setdefault("offline_started", now)
+                cpu = _metric(node, "cpu", self._fractions)
+                mem = _metric(node, "memory", self._fractions)
+                disk = _metric(node, "disk", self._fractions)
                 # 离线节点的指标可能是陈旧历史值，跳过其高负载告警，避免死节点误报。
                 high = is_online and ((cpu is not None and cpu >= self.config.cpu_threshold) or (mem is not None and mem >= self.config.memory_threshold) or (disk is not None and disk >= self.config.disk_threshold))
                 record["high"] = record.get("high", 0) + 1 if high else 0
+                if not is_online and record["active"].get("high"):
+                    # 离线期间指标不再更新，清空高负载状态，避免节点重新上线后
+                    # 误报"负载恢复"，也避免该状态长期残留。
+                    record["active"]["high"] = False
                 name = node.get("name") or key
                 uptime = _num(node.get("uptime"))
                 prev_uptime = _num(record.get("uptime"))
@@ -822,12 +1120,14 @@ class KomariWatchPlugin(Star):
                         and self._can_alert(record, "offline", now)):
                     record["sent"]["offline"] = now
                     record["active"]["offline"] = True
-                    record["offline_started"] = now
                     offline_alerted.append(name)
                 elif is_online and record["active"].get("offline"):
                     duration = self._fmt_duration(now - record.get("offline_started", now))
                     record["active"]["offline"] = False
+                    record.pop("offline_started", None)
                     offline_recovered.append((name, duration))
+                elif is_online:
+                    record.pop("offline_started", None)
                 if (not is_online and record["active"].get("offline")
                         and self.config.long_offline_remind_hours > 0):
                     offline_secs = now - record.get("offline_started", now)
@@ -852,6 +1152,8 @@ class KomariWatchPlugin(Star):
                     duration = self._fmt_duration(now - record.get("high_started", now))
                     record["active"]["high"] = False
                     high_recovered.append((name, duration))
+                expiring += self._check_expire(node, record, name, now)
+                traffic_alerts += self._check_traffic(node, record, name, now, is_online)
             alerts: list[str] = []
             if offline_alerted:
                 if len(offline_alerted) == 1:
@@ -871,7 +1173,9 @@ class KomariWatchPlugin(Star):
                     alerts.append(f"✅ Komari 负载恢复\n{len(high_recovered)} 个节点已恢复：\n" + "\n".join(f"· {n}（持续时长 {d}）" for n, d in high_recovered))
             alerts.extend(restarts)
             alerts.extend(long_offline)
+            alerts.extend(expiring)
             alerts.extend(high_alerted)
+            alerts.extend(traffic_alerts)
             self._prune_missing(known_keys)
             self._prune_muted()
             for alert in alerts:
@@ -894,7 +1198,14 @@ class KomariWatchPlugin(Star):
             while not self._stop.is_set():
                 failed = False
                 if self._targets() and self.config.komari_url:
-                    failed, _ = await self._check_once()
+                    try:
+                        failed, _ = await self._check_once()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # 单个周期内的意外异常不应终止整个监控循环，否则监控会静默失效。
+                        failed = True
+                        self.logger.exception("监控循环本轮异常，已跳过并继续下一轮：%s", exc)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self._poll_delay(failed))
                 except asyncio.TimeoutError:
@@ -917,7 +1228,8 @@ class KomariWatchPlugin(Star):
                 item.setdefault("updated_at", stamp)
             # 只为缺失内存/磁盘指标的在线节点拉历史记录补全展示，
             # 不再因个别节点缺指标而对全部节点发起 N 次请求。
-            lacking = [item for item in live if _metric(item, "memory") is None or _metric(item, "disk") is None]
+            lacking = [item for item in live
+                       if _metric(item, "memory", self._fractions) is None or _metric(item, "disk", self._fractions) is None]
             if lacking:
                 history_by_key = {self._node_key(item): item for item in await self._history_realtime(lacking)}
                 for item in live:
@@ -951,7 +1263,7 @@ class KomariWatchPlugin(Star):
             return
         selected = self._visible(self._select(nodes, args))
         if args and str(args[0]).strip() and nodes and not selected:
-            yield event.plain_result(f"没有匹配「{args[0]}」的节点，可发送 /komari_nodes 查看节点列表。")
+            yield event.plain_result(f"没有匹配{self._keyword_hint(args)}的节点，可发送 /komari_nodes 查看节点列表。")
             return
         yield await self._report_result(event, selected)
 
@@ -978,23 +1290,23 @@ class KomariWatchPlugin(Star):
             node["is_online"] = self._node_key(node) in live_keys
         selected = self._visible(self._select(merged, args))
         if args and str(args[0]).strip() and merged and not selected:
-            yield event.plain_result(f"没有匹配「{args[0]}」的节点，可发送 /komari_nodes 查看节点列表。")
+            yield event.plain_result(f"没有匹配{self._keyword_hint(args)}的节点，可发送 /komari_nodes 查看节点列表。")
             return
         yield await self._report_result(event, selected)
 
     @filter.command("komari_history", alias=["khistory", "历史"])
     async def komari_history(self, event: AstrMessageEvent, *args):
-        """查询历史资源趋势；如 /komari_history 6 nodeA（小时数 1-24，可加节点名过滤）。"""
+        """查询历史资源趋势；如 /komari_history 6 nodeA（小时数 1-24，可加节点名或 group:/tag: 过滤）。"""
         self._start_monitor()
-        hours, keyword = 1, ""
+        hours, tokens = 1, []
         for arg in args:
             text = str(arg).strip()
             if not text:
                 continue
             if text.isdigit():
                 hours = int(text)
-            elif not keyword:
-                keyword = text
+            else:
+                tokens.append(text)
         hours = max(1, min(hours, 24))
         async with self._check_lock:
             static, error = await self._snapshot()
@@ -1005,10 +1317,10 @@ class KomariWatchPlugin(Star):
         if not static:
             yield event.plain_result("Komari 没有返回节点。")
             return
-        if keyword:
-            matched = self._select(static, (keyword,))
+        if tokens:
+            matched = self._select(static, tuple(tokens))
             if not matched:
-                yield event.plain_result(f"没有匹配「{keyword}」的节点。")
+                yield event.plain_result(f"没有匹配{self._keyword_hint(tuple(tokens))}的节点。")
                 return
             static = matched
         tasks = [self._history_by_node(node, hours) for node in static]
@@ -1026,16 +1338,120 @@ class KomariWatchPlugin(Star):
         chain = await self._chain_from_html(self._history_html(series_by_node, hours), self._history_text(series_by_node, hours))
         yield event.chain_result(chain)
 
+    @filter.command("komari_ping", alias=["kping", "延迟"])
+    async def komari_ping(self, event: AstrMessageEvent, *args):
+        """查看 Ping 任务的延迟与丢包；如 /komari_ping 4 nodeA（小时数 1-24，默认 1）。"""
+        self._start_monitor()
+        hours, tokens = 1, []
+        for arg in args:
+            text = str(arg).strip()
+            if not text:
+                continue
+            if text.isdigit():
+                hours = int(text)
+            else:
+                tokens.append(text)
+        hours = max(1, min(hours, 24))
+        async with self._check_lock:
+            nodes, error = await self._snapshot()
+        if error:
+            yield event.plain_result(error)
+            return
+        selected = self._visible(self._select(nodes, tuple(tokens)))[:5]
+        if not selected:
+            if tokens:
+                yield event.plain_result(f"没有匹配{self._keyword_hint(tuple(tokens))}的节点。")
+            else:
+                yield event.plain_result("Komari 没有返回节点。")
+            return
+        lines = [f"🏓 Komari 延迟（最近 {hours} 小时）"]
+        empty = 0
+        for node in selected:
+            name = node.get("name") or node.get("hostname") or node.get("id") or "未知节点"
+            grouped = self._ping_stats(await self._ping_records(node.get("uuid") or node.get("id"), hours))
+            if not grouped:
+                empty += 1
+                lines.append(f"{name}：没有延迟记录")
+                continue
+            lines.append(name)
+            lines.extend(self._ping_lines(grouped))
+        if empty == len(selected):
+            lines.append("面板未返回延迟数据：可能未配置 Ping 任务，或该接口被限制。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("komari_recent", alias=["krecent", "最近上报"])
+    async def komari_recent(self, event: AstrMessageEvent, *args):
+        """查看节点最近一条上报明细（温度、进程数、连接数、累计流量等）；如 /komari_recent nodeA。"""
+        self._start_monitor()
+        async with self._check_lock:
+            nodes, error = await self._snapshot()
+        if error:
+            yield event.plain_result(error)
+            return
+        selected = self._visible(self._select(nodes, args))[:5]
+        if not selected:
+            if args and str(args[0]).strip():
+                yield event.plain_result(f"没有匹配{self._keyword_hint(args)}的节点。")
+            else:
+                yield event.plain_result("Komari 没有返回节点。")
+            return
+        lines = ["🕒 Komari 最近上报"]
+        for node in selected:
+            name = node.get("name") or node.get("hostname") or node.get("id") or "未知节点"
+            record, error = await self._recent_record(node)
+            if not record:
+                lines.append(f"{name}：{error}")
+                continue
+            lines.append(f"{name} · {self._reltime(record.get('time'))}")
+            lines.append(self._recent_detail(record))
+        yield event.plain_result("\n".join(lines))
+
+    def _recent_detail(self, record: dict[str, Any]) -> str:
+        parts: list[str] = []
+        cpu = _num(record.get("cpu"))
+        if cpu is not None:
+            parts.append(f"CPU {cpu:.1f}%")
+        gpu = _num(record.get("gpu"))
+        if gpu is not None:
+            parts.append(f"GPU {gpu:.1f}%")
+        ram_used, ram_total = _num(record.get("ram")), _num(record.get("ram_total"))
+        if ram_used is not None and ram_total:
+            parts.append(f"内存 {self._fmt_bytes(ram_used)}/{self._fmt_bytes(ram_total)}（{ram_used / ram_total * 100:.0f}%）")
+        disk_used, disk_total = _num(record.get("disk")), _num(record.get("disk_total"))
+        if disk_used is not None and disk_total:
+            parts.append(f"磁盘 {self._fmt_bytes(disk_used)}/{self._fmt_bytes(disk_total)}（{disk_used / disk_total * 100:.0f}%）")
+        load = _num(record.get("load"))
+        if load is not None:
+            parts.append(f"负载 {load:.2f}")
+        temp = _num(record.get("temp"))
+        if temp is not None:
+            parts.append(f"温度 {temp:.1f}℃")
+        process = _num(record.get("process"))
+        if process is not None:
+            parts.append(f"进程 {int(process)}")
+        connections = _num(record.get("connections"))
+        if connections is not None:
+            parts.append(f"连接 {int(connections)}")
+        net_in, net_out = _num(record.get("net_in")), _num(record.get("net_out"))
+        if net_in is not None or net_out is not None:
+            parts.append(f"↑{self._fmt_speed(net_out)} ↓{self._fmt_speed(net_in)}")
+        total_up, total_down = _num(record.get("net_total_up")), _num(record.get("net_total_down"))
+        if total_up is not None or total_down is not None:
+            parts.append(f"累计 ↑{self._fmt_bytes(total_up)} ↓{self._fmt_bytes(total_down)}")
+        return " / ".join(parts) if parts else "无可用指标。"
+
     @filter.command("komari_help", alias=["khelp", "komari帮助"])
     async def komari_help(self, event: AstrMessageEvent):
         """查看 Komari 插件全部命令。"""
         lines = [
             "📖 Komari 监控命令",
-            "/komari_status [节点] - 状态卡片",
-            "/komari_realtime [节点] - WebSocket 实时数据",
+            "/komari_status [节点|group:x|tag:x] - 状态卡片",
+            "/komari_realtime [节点|group:x|tag:x] - WebSocket 实时数据",
             "/komari_history [小时] [节点] - 历史趋势（1-24 小时）",
-            "/komari_nodes - 节点列表速查",
-            "/komari_top [指标] [数量] - 资源占用 Top 榜（cpu/mem/disk/uptime）",
+            "/komari_ping [小时] [节点] - Ping 延迟与丢包（1-24 小时）",
+            "/komari_recent [节点] - 最近一条上报明细",
+            "/komari_nodes - 节点列表速查（含分组与标签）",
+            "/komari_top [指标] [数量] - 资源占用 Top 榜（cpu/mem/disk/gpu/uptime）",
             "/komari_alerts - 最近告警记录",
             "/komari_public - 站点信息",
             "/komari_version - 服务端版本",
@@ -1060,20 +1476,23 @@ class KomariWatchPlugin(Star):
         excluded = 0
         for node in static:
             name = node.get("name") or node.get("hostname") or node.get("id") or "未知节点"
+            group = self._fmt_group(node)
+            suffix = f"（{group}）" if group else ""
             if self._monitored(node):
-                lines.append(f"· {name}")
+                lines.append(f"· {name}{suffix}")
             else:
-                lines.append(f"· {name}（已被 filter 配置排除）")
+                lines.append(f"· {name}{suffix}（已被 filter 配置排除）")
                 excluded += 1
         summary = f"共 {len(static)} 个节点"
         if excluded:
             summary += f"，其中 {excluded} 个被过滤配置排除"
         lines.append(summary)
+        lines.append("提示：查询命令可用 group:分组名 或 tag:标签 筛选节点。")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("komari_top", alias=["ktop", "节点排行"])
     async def komari_top(self, event: AstrMessageEvent, *args):
-        """查看资源占用 Top 榜；如 /komari_top mem 10（指标 cpu/mem/disk/uptime，默认 cpu 前 5，仅在线节点）。"""
+        """查看资源占用 Top 榜；如 /komari_top mem 10（指标 cpu/mem/disk/gpu/uptime，默认 cpu 前 5，仅在线节点）。"""
         self._start_monitor()
         metric, count = "cpu", 5
         for arg in args:
@@ -1084,6 +1503,8 @@ class KomariWatchPlugin(Star):
                 metric = "memory"
             elif text in ("disk", "d", "磁盘"):
                 metric = "disk"
+            elif text in ("gpu", "g", "显卡"):
+                metric = "gpu"
             elif text in ("uptime", "u", "运行时长"):
                 metric = "uptime"
             elif text.isdigit():
@@ -1097,13 +1518,13 @@ class KomariWatchPlugin(Star):
         if metric == "uptime":
             scored = [(_num(node.get("uptime")), node) for node in self._visible(nodes) if node.get("is_online")]
         else:
-            scored = [(_metric(node, metric), node) for node in self._visible(nodes) if node.get("is_online")]
+            scored = [(_metric(node, metric, self._fractions), node) for node in self._visible(nodes) if node.get("is_online")]
         scored = [(value, node) for value, node in scored if value is not None]
         if not scored:
             yield event.plain_result("没有可排序的在线节点。")
             return
         scored.sort(key=lambda pair: pair[0], reverse=True)
-        label = {"cpu": "CPU", "memory": "内存", "disk": "磁盘", "uptime": "运行时长"}[metric]
+        label = {"cpu": "CPU", "memory": "内存", "disk": "磁盘", "gpu": "GPU", "uptime": "运行时长"}[metric]
         top = scored[:count]
         lines = [f"🏆 Komari {label} Top {len(top)}（在线节点）"]
         for rank, (value, node) in enumerate(top, 1):
