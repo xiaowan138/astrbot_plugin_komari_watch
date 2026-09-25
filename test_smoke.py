@@ -402,6 +402,133 @@ async def run():
     check("no false load recovery", not any("负载恢复" in s for s in sent))
     plugin.config.high_load_cycles = 2
 
+    # ---- 1.7.0: 数值守卫、文本回退、流量明细 ----
+    check("num rejects bool", m._num(True) is None and m._num(False) is None)
+    check("num parses str", m._num("3.5") == 3.5)
+    check("metric ignores bool", m._metric({"cpu_usage": True}, "cpu") is None)
+    check("speed none", plugin._fmt_speed(None) == "-")
+    check("speed value", plugin._fmt_speed(2048) == "2.0 KB/s")
+
+    check("traffic line remaining",
+          "剩余" in plugin._traffic_line({"traffic_limit": 1000, "net_total_up": 400, "net_total_down": 400}))
+    check("traffic line no limit", "未设限额" in plugin._traffic_line({"net_total_up": 100}))
+    check("traffic line empty", plugin._traffic_line({}) == "")
+    check("traffic line limit no counter", "面板未提供累计流量" in plugin._traffic_line({"traffic_limit": 500}))
+
+    text_node = {"uuid": "f1", "name": "full", "is_online": True, "cpu_usage": 10, "gpu": 40,
+                 "traffic_limit": 1000, "net_total_up": 100, "net_total_down": 100,
+                 "expired_at": soon, "group": "Tokyo", "tags": "ssd"}
+    plain = plugin._format_report([text_node])
+    check("text report gpu", "GPU 40.0%" in plain)
+    check("text report traffic", "流量" in plain)
+    check("text report expire", "剩余" in plain)
+    check("text report group", "Tokyo" in plain)
+
+    # ---- 1.7.0: 长期离线提醒不再依赖离线告警 ----
+    plugin.config.offline_grace_cycles = 2
+    plugin.config.alert_cooldown = 1800
+    plugin.config.long_offline_remind_hours = 1
+    plugin.config.high_load_cycles = 2
+    plugin.state["muted"] = {}
+    plugin.state["targets"] = ["test:origin"]
+    plugin.state["nodes"] = {}
+    now_ts = datetime.now(timezone.utc).timestamp()
+    # 离线告警刚发过（处于冷却期，本轮不会再发），但节点已离线 2 小时。
+    plugin.state["nodes"]["d1"] = {"offline": 5, "high": 0, "sent": {"offline": now_ts},
+                                   "active": {"offline": False}, "offline_started": now_ts - 7200}
+    long_off_nodes = [{"uuid": "d1", "name": "down", "is_online": False}]
+
+    async def long_off_snapshot():
+        return long_off_nodes, None
+
+    plugin._snapshot = long_off_snapshot
+    sent.clear()
+    await plugin._check_once()
+    check("long offline without active alert", any("仍离线" in s for s in sent))
+    check("long offline no duplicate offline alert", not any("离线告警" in s for s in sent))
+    plugin.config.long_offline_remind_hours = 0
+
+    # ---- 1.7.0: 多时刻日报 ----
+    plugin.config.status_report_time = "09:00,18:00"
+    plugin.state.pop("last_status_report", None)
+    slot = datetime.now().replace(hour=18, minute=30, second=0, microsecond=0)
+    check("fixed report second slot", plugin._fixed_report_due(slot.timestamp()))
+    check("fixed report first slot", plugin._fixed_report_due(slot.replace(hour=10).timestamp()))
+    check("fixed report before all slots", not plugin._fixed_report_due(slot.replace(hour=8).timestamp()))
+    plugin.state["last_status_report"] = slot.timestamp()
+    check("fixed report once per slot", not plugin._fixed_report_due(slot.timestamp()))
+    plugin.config.status_report_time = "25:00"
+    check("fixed report invalid", not plugin._fixed_report_due(slot.timestamp()))
+    plugin.config.status_report_time = ""
+
+    # ---- 1.7.0: /komari_traffic ----
+    traffic_nodes = [
+        {"uuid": "t1", "name": "big", "is_online": True, "traffic_limit": 1000, "net_total_up": 600, "net_total_down": 300},
+        {"uuid": "t2", "name": "small", "is_online": True, "traffic_limit": 1000, "net_total_up": 50, "net_total_down": 50},
+        {"uuid": "t3", "name": "nolimit", "is_online": True, "net_total_up": 10, "net_total_down": 20},
+        {"uuid": "t4", "name": "nodata", "is_online": True},
+    ]
+
+    async def traffic_snapshot():
+        return traffic_nodes, None
+
+    plugin._snapshot = traffic_snapshot
+    results = [r async for r in plugin.komari_traffic(FakeEvent(), "2")]
+    traffic_text = results[0][1]
+    check("traffic command sorted", traffic_text.index("big") < traffic_text.index("small"))
+    check("traffic command truncation", "仅显示前 2 个" in traffic_text)
+    check("traffic command remaining", "剩余" in traffic_text)
+    check("traffic command skips no-data", "nodata" not in traffic_text)
+
+    # ---- 1.7.0: /komari_top 分组筛选 ----
+    top_nodes = [
+        {"uuid": "a", "name": "tokyo-a", "is_online": True, "cpu_usage": 90, "group": "Tokyo"},
+        {"uuid": "b", "name": "osaka-b", "is_online": True, "cpu_usage": 80, "group": "Osaka"},
+    ]
+
+    async def top_snapshot():
+        return top_nodes, None
+
+    plugin._snapshot = top_snapshot
+    results = [r async for r in plugin.komari_top(FakeEvent(), "cpu", "group:tokyo")]
+    check("top group filter", "tokyo-a" in results[0][1] and "osaka-b" not in results[0][1])
+    results = [r async for r in plugin.komari_top(FakeEvent(), "cpu", "group:osaka")]
+    check("top group filter miss", "osaka-b" in results[0][1] and "tokyo-a" not in results[0][1])
+
+    # ---- 1.7.0: /komari_alerts 条数 ----
+    plugin.state["alert_history"] = [{"time": 1757000000 + i, "text": f"alert{i}"} for i in range(5)]
+    results = [r async for r in plugin.komari_alerts(FakeEvent(), "2")]
+    alerts_text = results[0][1]
+    check("alerts count", "alert3" in alerts_text and "alert4" in alerts_text and "alert2" not in alerts_text)
+    check("alerts header", "共 5 条" in alerts_text)
+
+    # ---- 1.7.0: /komari_check 启动后台监控 ----
+    started: list[bool] = []
+    plugin._start_monitor = lambda: started.append(True)
+
+    async def ok_check(track_failure=True):
+        return False, {"online": 1, "offline": 0, "alerts": 0}
+
+    plugin._check_once = ok_check
+    results = [r async for r in plugin.komari_check(FakeEvent())]
+    check("check starts monitor", started == [True])
+    check("check summary", "在线 1" in results[0][1])
+    plugin.__dict__.pop("_start_monitor", None)
+
+    # ---- 1.7.0: ping 截断提示 ----
+    many_nodes = [{"uuid": f"p{i}", "name": f"node{i}", "is_online": True} for i in range(7)]
+
+    async def many_snapshot():
+        return many_nodes, None
+
+    async def no_ping(uuid, hours):
+        return []
+
+    plugin._snapshot = many_snapshot
+    plugin._ping_records = no_ping
+    results = [r async for r in plugin.komari_ping(FakeEvent(), "1")]
+    check("ping truncation hint", "仅显示前 5 个" in results[0][1])
+
     # ---- 1.6.0: 监控循环异常后仍存活 ----
     logging.disable(logging.CRITICAL)
     plugin._stop.clear()

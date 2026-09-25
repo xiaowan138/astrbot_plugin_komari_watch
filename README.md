@@ -12,9 +12,10 @@
 - `/komari_history`（别名 `/khistory`、`/历史`）：查询历史资源趋势曲线（CPU / 内存 / 磁盘 / GPU / 上下行流量，均标注当前值与峰值，并标注数据起止时间），如 `/komari_history 6 nodeA`（小时数 1-24，可加节点名或 `group:` / `tag:` 过滤）。
 - `/komari_ping`（别名 `/kping`、`/延迟`）：查看 Ping 任务的延迟与丢包，如 `/komari_ping 4 nodeA`（小时数 1-24，默认 1），按任务分别显示平均/最低/最高延迟与丢包率。
 - `/komari_recent`（别名 `/krecent`、`/最近上报`）：查看节点最近一条上报明细（CPU、GPU、内存、磁盘、负载、温度、进程数、连接数、累计流量等）。
+- `/komari_traffic`（别名 `/ktraffic`、`/流量`）：流量用量总览，按已用量排序显示已用/限额/剩余与使用率，如 `/komari_traffic 10 group:Tokyo`（默认前 10，最多 50）；未设限额的节点只报累计用量。
 - `/komari_nodes`（别名 `/knodes`）：列出全部节点名称、所属分组与标签，以及过滤排除情况，便于填写 `filter_nodes` 与查询参数。
-- `/komari_top [指标] [数量]`（别名 `/ktop`）：资源占用 Top 榜，如 `/komari_top mem 10`（指标 cpu/mem/disk/gpu/uptime，默认 cpu 前 5，仅统计在线节点）。
-- `/komari_alerts`（别名 `/kalerts`）：查看最近的一批告警记录。
+- `/komari_top [指标] [数量] [节点|group:x|tag:x]`（别名 `/ktop`）：资源占用 Top 榜，如 `/komari_top mem 10`（指标 cpu/mem/disk/gpu/uptime，默认 cpu 前 5，仅统计在线节点）。
+- `/komari_alerts [数量]`（别名 `/kalerts`）：查看最近的告警记录，如 `/komari_alerts 20`（默认 10，最多 50）。
 - `/komari_mute <分钟> [all]`：临时静默告警（默认 30 分钟；默认只静默当前会话，加 `all` 静默全部绑定会话）；`/komari_unmute [all]` 提前恢复。
 - `/komari_help`（别名 `/khelp`）：全部命令总览。
 - `/komari_bind`：把当前 OneBot 私聊或群聊绑定为告警接收目标。
@@ -33,7 +34,7 @@
 支持的可选配置：
 - `filter_mode` / `filter_nodes`：节点过滤。`filter_mode` 为 `none`（默认，不过滤）、`allow`（只监控列表中节点）或 `deny`（排除列表中节点）；`filter_nodes` 填写节点名，多个用英文逗号分隔，支持子串匹配（匹配名称、主机名、id、uuid）。
 - `status_report_interval`：定时状态推送间隔（小时），大于 0 时后台监控会按该间隔向绑定会话推送状态卡片，0 表示关闭。
-- `status_report_time`：每天固定时刻（本地时间 `HH:MM`，如 `09:00`）推送状态卡片，留空不启用；可与间隔推送共存，先到先推。
+- `status_report_time`：每天固定时刻（本地时间 `HH:MM`，如 `09:00`）推送状态卡片，多个时刻用英文逗号分隔（如 `09:00,18:00`），留空不启用；可与间隔推送共存，先到先推。
 - `prune_missing_cycles`：节点从服务器消失多少周期后清理其监控状态，防止 `state.json` 无限增长。
 - `panel_fail_cycles`：面板连续多少次检查失败后推送"面板不可达"告警（恢复时自动通知），0 表示关闭。
 - `notify_restart`：检测到节点运行时间回退（重启）时推送通知。

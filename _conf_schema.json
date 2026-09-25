@@ -15,7 +15,7 @@
   "filter_mode": {"type": "string", "description": "节点过滤模式", "hint": "none=不过滤；allow=只监控列表中节点；deny=排除列表中节点", "default": "none"},
   "filter_nodes": {"type": "string", "description": "过滤/白名单节点", "hint": "节点名，多个用英文逗号分隔，支持子串匹配", "default": ""},
   "status_report_interval": {"type": "int", "description": "定时状态推送间隔（小时）", "hint": "大于 0 时按该间隔向绑定会话推送状态卡片，0 表示关闭", "default": 0, "minimum": 0, "maximum": 720},
-  "status_report_time": {"type": "string", "description": "每天定时推送时刻", "hint": "本地时间 HH:MM（如 09:00），到点自动推送状态卡片，留空不启用", "default": ""},
+  "status_report_time": {"type": "string", "description": "每天定时推送时刻", "hint": "本地时间 HH:MM（如 09:00），多个时刻用英文逗号分隔（如 09:00,18:00），到点自动推送状态卡片，留空不启用", "default": ""},
   "prune_missing_cycles": {"type": "int", "description": "节点清理周期", "hint": "节点从服务器消失多少周期后清理其监控状态", "default": 5, "minimum": 1, "maximum": 100},
   "panel_fail_cycles": {"type": "int", "description": "面板故障告警周期", "hint": "连续多少次检查失败后推送面板不可达告警，恢复时自动通知，0 表示关闭", "default": 3, "minimum": 0, "maximum": 10},
   "notify_restart": {"type": "bool", "description": "推送节点重启通知", "hint": "检测到运行时间回退时推送提醒", "default": true},
